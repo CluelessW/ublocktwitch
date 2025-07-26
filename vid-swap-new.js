@@ -1,111 +1,96 @@
 // ==UserScript==
-// @name         Twitch Adblocker + Force Best Quality
-// @namespace    https://github.com/cleanlock/
-// @version      2.0
-// @description  Bypass Twitch ads and force highest quality (chunked) stream
-// @author       Edited by ChatGPT
+// @name         Twitch Adblock + Force Chunked Quality
+// @namespace    https://yourdomain.com/
+// @version      1.0
+// @description  Block Twitch ads and force highest quality (chunked) stream
+// @author       OpenAI
+// @match        https://player.twitch.tv/*
 // @match        https://www.twitch.tv/*
 // @grant        none
 // ==/UserScript==
 
-(function () {
+(function() {
     'use strict';
 
-    const OPT_MODE_STRIP_AD_SEGMENTS = false;
     const OPT_MODE_NOTIFY_ADS_WATCHED = true;
-
-    function hookWorker() {
-        const workerBlob = new Blob([`
-            const originalFetch = fetch;
-            self.fetch = async function(resource, init) {
-                if (typeof resource === 'string' && resource.includes('.m3u8')) {
-                    const res = await originalFetch(resource, init);
-                    const text = await res.text();
-                    if (text.includes('#EXT-X-DATERANGE:CLASS="twitch-stitched-ad"')) {
-                        return new Response('', { status: 200 });
-                    } else {
-                        // Force best quality: extract chunked stream
-                        const lines = text.split('\\n');
-                        let chunkedUrl = null;
-                        for (let i = 0; i < lines.length; i++) {
-                            if (lines[i].includes('VIDEO="chunked"')) {
-                                chunkedUrl = lines[i + 1];
-                                break;
-                            }
-                        }
-                        if (chunkedUrl) {
-                            const baseUrl = resource.substring(0, resource.lastIndexOf('/') + 1);
-                            const chunkedRes = await originalFetch(baseUrl + chunkedUrl, init);
-                            return chunkedRes;
-                        } else {
-                            return new Response(text, { status: 200 });
-                        }
-                    }
-                }
-                return originalFetch(resource, init);
-            };
-            self.addEventListener('message', function (event) {
-                if (event.data && event.data.type === 'run') {
-                    eval(event.data.script);
-                }
-            });
-        `], { type: 'application/javascript' });
-
-        const workerUrl = URL.createObjectURL(workerBlob);
-        const originalWorker = window.Worker;
-
-        window.Worker = function (scriptURL, options) {
-            if (typeof scriptURL === 'string' && scriptURL.includes('video')) {
-                return new originalWorker(workerUrl, options);
-            }
-            return new originalWorker(scriptURL, options);
-        };
-    }
 
     function hookFetch() {
         const originalFetch = window.fetch;
         window.fetch = async function(resource, init) {
-            try {
-                if (typeof resource === 'string' && resource.includes('.m3u8')) {
-                    const res = await originalFetch(resource, init);
-                    const text = await res.text();
-                    if (text.includes('#EXT-X-DATERANGE:CLASS="twitch-stitched-ad"')) {
-                        if (OPT_MODE_NOTIFY_ADS_WATCHED) {
-                            console.warn('[Adblock] Midroll ad detected. Simulating ad watch...');
-                            // Simulate ad-watching event if needed
+            if (typeof resource === 'string') {
+                // 🎯 Intercept GraphQL video playback config
+                if (resource.includes('/gql')) {
+                    const isPlaybackRequest = init?.body?.includes('PlaybackAccessToken') || init?.body?.includes('PlaybackAccessToken_Template');
+
+                    if (isPlaybackRequest) {
+                        const response = await originalFetch(resource, init);
+                        const cloned = response.clone();
+                        const json = await cloned.json();
+
+                        try {
+                            // 🛠 Modify to force "chunked" playback
+                            for (const entry of json) {
+                                if (entry?.data?.streamPlaybackAccessToken?.value) {
+                                    const token = JSON.parse(entry.data.streamPlaybackAccessToken.value);
+                                    token.player_type = 'site';
+                                    token.quality = 'chunked';
+                                    entry.data.streamPlaybackAccessToken.value = JSON.stringify(token);
+                                }
+                            }
+                        } catch (e) {
+                            console.warn('Could not force chunked quality:', e);
                         }
 
-                        return new Response('', { status: 200 });
-                    } else {
-                        // Force best quality: extract chunked stream
-                        const lines = text.split('\\n');
-                        let chunkedUrl = null;
-                        for (let i = 0; i < lines.length; i++) {
-                            if (lines[i].includes('VIDEO="chunked"')) {
-                                chunkedUrl = lines[i + 1];
-                                break;
-                            }
-                        }
-                        if (chunkedUrl) {
-                            const baseUrl = resource.substring(0, resource.lastIndexOf('/') + 1);
-                            const chunkedRes = await originalFetch(baseUrl + chunkedUrl, init);
-                            return chunkedRes;
-                        } else {
-                            return new Response(text, { status: 200 });
-                        }
+                        return new Response(JSON.stringify(json), {
+                            status: response.status,
+                            statusText: response.statusText,
+                            headers: response.headers,
+                        });
                     }
                 }
-            } catch (e) {
-                console.error('[Adblock] Error in fetch override:', e);
+
+                // 🎯 Intercept .m3u8 playlist to strip ad segments
+                if (resource.includes('.m3u8')) {
+                    const res = await originalFetch(resource, init);
+                    const text = await res.text();
+
+                    if (text.includes('#EXT-X-DATERANGE:CLASS="twitch-stitched-ad"')) {
+                        console.log('[TwitchAdblock] Ad segment detected — blocking...');
+                        if (OPT_MODE_NOTIFY_ADS_WATCHED) {
+                            notifyAdsWatched(resource);
+                        }
+                        return new Response('', { status: 200 });
+                    }
+
+                    return new Response(text, { status: 200 });
+                }
             }
+
             return originalFetch(resource, init);
         };
     }
 
-    function run() {
-        hookWorker();
-        hookFetch();
+    function notifyAdsWatched(uri) {
+        // Optionally spoof ad views to help Twitch not suspect anything
+        const payload = {
+            event: 'video_ad_quartile',
+            timestamp: Date.now(),
+            data: {
+                uri: uri,
+                quartile: 'complete',
+            }
+        };
+        navigator.sendBeacon('/track', JSON.stringify(payload));
     }
 
-    run();
+    function waitForTwitch() {
+        if (typeof window.fetch === 'function') {
+            hookFetch();
+            console.log('[TwitchAdblock] Hooked fetch successfully.');
+        } else {
+            setTimeout(waitForTwitch, 500);
+        }
+    }
+
+    waitForTwitch();
 })();
